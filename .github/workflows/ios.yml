@@ -98,6 +98,12 @@ jobs:
           otool -L "$f"
           otool -l "$f" | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS' || true
           strings "$f" | grep -F cacert.pem
+          minos="$(otool -l "$f" | awk '/cmd LC_(BUILD_VERSION|VERSION_MIN_IPHONEOS)/ { found = 1 } found && ($1 == "minos" || $1 == "version") { print $2; exit }')"
+          if [ "$minos" != "$IOS_MIN_VERSION" ]; then
+            echo "::error title=$f::minimum iOS version is '$minos', expected $IOS_MIN_VERSION"
+            exit 1
+          fi
+          echo "::notice title=$f::$(lipo -archs "$f"), minimum iOS $minos"
         done
 
     - name: Package

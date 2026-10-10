@@ -1,0 +1,159 @@
+name: Build for iOS (jailbreak)
+
+on:
+  push:
+    branches:
+    - '**'
+    paths-ignore:
+    - 'README.md'
+    - 'LICENSE.txt'
+    - 'RELNOTES'
+    - 'TODO'
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  OPENSSL_VERSION: 3.5.9
+  OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+  IOS_MIN_VERSION: '12.0'
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write   # attach the .deb files to a published release
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install packaging tools
+      run: brew install ldid dpkg
+
+    - name: Restore OpenSSL cache
+      id: openssl-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/openssl-ios
+        key: openssl-${{ env.OPENSSL_VERSION }}-ios${{ env.IOS_MIN_VERSION }}-arm64-v1
+
+    - name: Build OpenSSL for iOS
+      if: steps.openssl-cache.outputs.cache-hit != 'true'
+      run: |
+        {
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz"
+          echo "$OPENSSL_SHA256  openssl-$OPENSSL_VERSION.tar.gz" | shasum -a 256 -c -
+          tar -xzf "openssl-$OPENSSL_VERSION.tar.gz"
+          cd "openssl-$OPENSSL_VERSION"
+          # no-module links the legacy provider (MD4, used by NTLM) into libcrypto
+          ./Configure ios64-xcrun no-shared no-module no-tests \
+            -miphoneos-version-min="$IOS_MIN_VERSION" \
+            --prefix="$HOME/openssl-ios" --openssldir=/etc/ssl
+          make -j"$(sysctl -n hw.ncpu)" build_libs
+          make install_dev
+        } 2>&1 | tee -a "$RUNNER_TEMP/build.log"
+
+    - name: Save OpenSSL cache
+      if: steps.openssl-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/openssl-ios
+        key: ${{ steps.openssl-cache.outputs.cache-primary-key }}
+
+    - name: Build
+      run: |
+        {
+          xcodebuild -version
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          cc="$(xcrun --sdk iphoneos -f clang)"
+          ossl="$HOME/openssl-ios"
+          for variant in rootless rootful; do
+            # Procursus' ca-certificates installs the CA bundle under the jailbreak prefix
+            if [ "$variant" = rootless ]; then prefix=/var/jb; else prefix=; fi
+            rm -f ./*.o proxytunnel
+            make -j"$(sysctl -n hw.ncpu)" \
+              CC="$cc" \
+              CFLAGS="-arch arm64 -isysroot $sdk -miphoneos-version-min=$IOS_MIN_VERSION -O2 -Wall" \
+              CPPFLAGS="-I$ossl/include -DDEFAULT_CA_FILE='\"$prefix/etc/ssl/certs/cacert.pem\"' -DDEFAULT_CA_DIR='\"$prefix/etc/ssl/certs/\"'" \
+              LDFLAGS="$ossl/lib/libssl.a $ossl/lib/libcrypto.a"
+            strip proxytunnel
+            ldid -S proxytunnel
+            mkdir -p "build/$variant"
+            mv proxytunnel "build/$variant/"
+          done
+        } 2>&1 | tee -a "$RUNNER_TEMP/build.log"
+
+    - name: Check
+      run: |
+        for f in build/*/proxytunnel; do
+          echo "== $f"
+          file "$f"
+          otool -L "$f"
+          otool -l "$f" | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS' || true
+          strings "$f" | grep -F cacert.pem
+        done
+
+    - name: Package
+      run: |
+        {
+          version="$(awk -F'"' '/^#define VERSION /{print $2}' config.h)"
+          mkdir -p packages
+          for variant in rootless rootful; do
+            if [ "$variant" = rootless ]; then arch=iphoneos-arm64; prefix=/var/jb; else arch=iphoneos-arm; prefix=; fi
+            root="$RUNNER_TEMP/deb-$variant"
+            rm -rf "$root"
+            install -d "$root$prefix/usr/bin" "$root$prefix/usr/share/doc/proxytunnel"
+            install -m 755 "build/$variant/proxytunnel" "$root$prefix/usr/bin/"
+            install -m 644 LICENSE.txt "$root$prefix/usr/share/doc/proxytunnel/"
+            size="$(du -sk "$root" | cut -f1)"
+            install -d "$root/DEBIAN"
+            printf '%s\n' \
+              "Package: proxytunnel" \
+              "Name: proxytunnel" \
+              "Version: $version" \
+              "Architecture: $arch" \
+              "Installed-Size: $size" \
+              "Section: Networking" \
+              "Maintainer: $GITHUB_REPOSITORY_OWNER <$GITHUB_REPOSITORY_OWNER@users.noreply.github.com>" \
+              "Author: Jos Visser <josv@osp.nl>, Mark Janssen <maniac@maniac.nl>" \
+              "Homepage: https://github.com/proxytunnel/proxytunnel" \
+              "Description: Create tcp tunnels through HTTPS proxies, for using with SSH" \
+              " Proxytunnel is a program that connects stdin and stdout to an origin" \
+              " server somewhere in the Internet through an industry standard HTTPS" \
+              " proxy. OpenSSL is statically linked." \
+              > "$root/DEBIAN/control"
+            dpkg-deb -Zgzip --root-owner-group -b "$root" "packages/proxytunnel_${version}_${arch}.deb"
+          done
+          ls -l packages
+        } 2>&1 | tee -a "$RUNNER_TEMP/build.log"
+
+    - name: Upload CI Artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: proxytunnel-${{ github.sha }}-iphoneos
+        path: packages/*.deb
+        if-no-files-found: error
+
+    - name: Upload to GitHub Release
+      uses: svenstaro/upload-release-action@v2
+      if: github.event_name == 'release'
+      with:
+        file: packages/*.deb
+        file_glob: true
+        tag: ${{ github.ref }}
+        overwrite: true
+
+    # Build logs need a login to view; annotations show up on the run page directly
+    - name: Show build log tail
+      if: failure()
+      run: |
+        [ -f "$RUNNER_TEMP/build.log" ] || exit 0
+        tail -n 40 "$RUNNER_TEMP/build.log" | tr -d '\r' | sed 's/%/%25/g' |
+          awk 'BEGIN { printf "::error title=Build log (last 40 lines)::" } { printf "%s%%0A", $0 } END { print "" }'
